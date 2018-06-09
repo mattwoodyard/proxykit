@@ -1,0 +1,26 @@
+[package]
+name = "mproxy"
+version = "0.1.0"
+authors = ["Matt Woodyard <matt@mattwoodyard.com>"]
+
+[dependencies]
+env_logger = "*"
+#actix = { path = "actix" }
+#actix-web = { path = "actix-web" } 
+actix = "0.5"
+actix-web = "0.6.10"
+bytes="*"
+futures = "0.1"
+http ="*"
+httparse = "*"
+native-tls = "*"
+net2 = "*"
+openssl = "0.10"
+slab = "*"
+tokio = "*"
+tokio-core = "*"
+tokio-io="0.1"
+tokio-openssl = "0.2"
+tokio-tls = "*"
+uri = "*"
+url ="*"
