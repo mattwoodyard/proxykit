@@ -14,6 +14,8 @@ extern crate tokio_tls;
 extern crate uuid;
 
 use futures::future::{err, ok, FutureResult};
+
+use futures::sink::Sink;
 use futures::stream::Stream;
 use hyper::client::connect::{Connect, Connected};
 use hyper::http::uri::Authority;
@@ -22,12 +24,14 @@ use hyper::server::conn::Http;
 use hyper::service::{service_fn, service_fn_ok};
 use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
 use mproxy::ca;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::io::{Error, ErrorKind};
 use std::net::ToSocketAddrs;
 use std::sync::Mutex;
 use tokio_io::io::copy;
+
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_tcp::TcpStream;
 
@@ -137,9 +141,10 @@ fn crappy_log(r: &Request<Body>) {
     println!("{:?} {}", r.method(), r.uri())
 }
 
-fn normalize_authority(a: &Authority) -> String {
-    let pp = a.port_u16().unwrap_or(80);
-    format!("{}:{}", a.host(), pp)
+fn normalize_authority(uri: &hyper::Uri) -> String {
+    // There are 3 forms
+    let pp = uri.port_u16().unwrap_or(80);
+    format!("{}:{}", uri.host().unwrap_or(""), pp)
 }
 
 pub struct UserIdentity {
@@ -171,30 +176,20 @@ pub trait SiteAuthorize {
     fn authorize(&self, i: &Identity, url: &str) -> Result<AuthzResult, String>;
 }
 
+#[derive(Clone)]
 pub struct AuthConfig<U, S, A>
 where
-    U: Authenticate,
-    S: SiteAuthorize,
-    A: Authorize,
+    U: Authenticate + Clone,
+    S: SiteAuthorize + Clone,
+    A: Authorize + Clone,
 {
     authenticate: U,
     site: S,
     authorize: A,
 }
 
-fn handle_http<C: Connect + 'static>(
-    client: &Client<C>,
-    req: Request<Body>,
-) -> Box<Future<Item = Response<Body>, Error = io::Error> + Send> {
-    let client = client.clone().request(req);
-    //TODO(matt) - map client errors to 50x codes
-    Box::new(client.map(|resp| resp).map_err(|e| {
-        println!("Error in upstream: {:?}", e);
-        io::Error::from(io::ErrorKind::Other)
-    }))
-}
-
 fn handle_tls_raw<C: Connect + 'static>(
+    req_uuid: uuid::Uuid,
     _client: &Client<C>,
     upstream_addr: std::net::SocketAddr,
     req: Request<Body>,
@@ -242,12 +237,11 @@ fn handle_tls_raw<C: Connect + 'static>(
     // result(200)
 }
 
-
-
 fn is_mitm(r: &Request<Body>, mitm_enabled: bool) -> bool {
     true
 }
 
+#[derive(Clone)]
 struct AdWareBlock;
 
 impl SiteAuthorize for AdWareBlock {
@@ -259,6 +253,7 @@ impl SiteAuthorize for AdWareBlock {
     }
 }
 
+#[derive(Clone)]
 struct AllowAll;
 
 impl Authorize for AllowAll {
@@ -267,6 +262,7 @@ impl Authorize for AllowAll {
     }
 }
 
+#[derive(Clone)]
 struct NoAuth;
 
 impl Authenticate for NoAuth {
@@ -276,29 +272,99 @@ impl Authenticate for NoAuth {
 }
 
 pub enum Trace {
+    TraceId(String),
+    TraceSecurity(String, openssl::x509::X509),
     TraceRequest(String, Request<Body>),
     TraceResponse(String, Request<Body>),
 }
 
+fn make_absolute(req: &mut Request<Body>) {
+    /* RFC 7312 5.4
+
+      When a proxy receives a request with an absolute-form of
+      request-target, the proxy MUST ignore the received Host header field
+      (if any) and instead replace it with the host information of the
+      request-target.  A proxy that forwards such a request MUST generate a
+      new Host field-value based on the received request-target rather than
+      forward the received Host field-value.
+    */
+    match req.method() {
+        &Method::CONNECT => {}
+        _ => {
+            let nhost: Option<String> = { req.uri().authority_part().map(|a| a.as_str().into()) };
+
+            if let Some(n) = nhost {
+                req.headers_mut()
+                    .insert(http::header::HOST, n.parse().unwrap());
+                return;
+            }
+
+            let nuri = req.headers().get(http::header::HOST).map(|host| {
+                let autht: Authority = host.to_str().unwrap().parse().unwrap();
+                
+                let mut builder = hyper::Uri::builder();
+                builder.authority(autht);
+                //TODO(matt) do as map[
+                if let Some(p) = req.uri().path_and_query() {
+                    builder.path_and_query(p.as_str());
+                }
+
+                if let Some(p) = req.uri().scheme_part() {
+                    builder.scheme(p.as_str());
+                } else {
+                    // Ok so this kind of sketchy, but since this is fixing up a client connection
+                    // we'll never see an https one. Why? https is via  CONNECT at the proxy
+                    builder.scheme("http");
+                }
+                builder.build().unwrap()
+            }); 
+            match nuri {
+                Some(n) => *req.uri_mut() = n,
+                None => {}
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
-struct Proxy {
+struct Proxy<U, S, A>
+where
+    U: Authenticate + Sync + Send + Clone + 'static,
+    S: SiteAuthorize + Sync + Send + Clone + 'static,
+    A: Authorize + Sync + Send + Clone + 'static,
+{
     //TODO(matt) - trace filter
     tracer: Option<mpsc::Sender<Trace>>,
     ca: Arc<ca::CertAuthority>,
+    auth_config: AuthConfig<U, S, A>,
 }
 
-impl Proxy {
-    fn handle<C: Connect + 'static, U: Authenticate, S: SiteAuthorize, A: Authorize>(
+impl<U, S, A> Proxy<U, S, A>
+where
+    U: Authenticate + Sync + Send + Clone,
+    S: SiteAuthorize + Sync + Send + Clone,
+    A: Authorize + Sync + Send + Clone,
+{
+    // Rework this instead of duping proxy do somehting else
+    fn dup(&self) -> Proxy<U, S, A> {
+        Proxy {
+            tracer: self.tracer.iter().map(|t| t.clone()).next(),
+            ca: self.ca.clone(),
+            auth_config: self.auth_config.clone(),
+        }
+    }
+
+    fn handle<C: Connect + 'static>(
         &self,
-        auth: &AuthConfig<U, S, A>,
         client: &Client<C>,
         req: Request<Body>,
     ) -> Box<Future<Item = Response<Body>, Error = io::Error> + Send> {
-        let hostname = req
-            .uri()
-            .authority_part()
-            .map(|x| normalize_authority(&x))
-            .unwrap();
+        let req_uuid = uuid::Uuid::new_v4();
+        println!("Begin request {}", req_uuid);
+
+        println!("Begin request {:?}", req.uri());
+
+        let hostname = normalize_authority(req.uri());
 
         // TODO this is slow and not async, and crappy
         let upstream_addr = match hostname.to_socket_addrs() {
@@ -313,12 +379,18 @@ impl Proxy {
             }
         };
 
-        let uid = auth.authenticate.authenticate(&req);
+        let uid = self.auth_config.authenticate.authenticate(&req);
 
         let x = uid
-            .and_then(|u| auth.site.authorize(&u, &hostname).map(|r| (u, r)))
+            .and_then(|u| {
+                self.auth_config
+                    .site
+                    .authorize(&u, &hostname)
+                    .map(|r| (u, r))
+            })
             .and_then(|(u, site_result)| {
-                auth.authorize
+                self.auth_config
+                    .authorize
                     .authorize(&u, &req)
                     .map(|ar| (u, site_result, ar))
             });
@@ -329,11 +401,12 @@ impl Proxy {
             _ => return result(403),
         };
 
-        self.handle_inner(upstream_addr, client, req)
+        self.handle_inner(req_uuid, upstream_addr, client, req)
     }
 
     fn handle_inner<C: Connect + 'static>(
         &self,
+        req_uuid: uuid::Uuid,
         upstream_addr: std::net::SocketAddr,
         client: &Client<C>,
         req: Request<Body>,
@@ -343,104 +416,215 @@ impl Proxy {
 
         match req.method() {
             &Method::CONNECT => match is_mitm(&req, mitm_enabled) {
-                true => self.handle_mitm(client.clone(), upstream_addr, req),
-                false => handle_tls_raw(client, upstream_addr, req),
+                true => self.handle_mitm(req_uuid, client.clone(), upstream_addr, req),
+                false => handle_tls_raw(req_uuid, client, upstream_addr, req),
             },
-            _ => handle_http(client, req),
+            _ => self.handle_http(req_uuid, client, req),
         }
     }
 
+    fn handle_http_forward<C: Connect + 'static>(
+        &self,
+        req_uuid: uuid::Uuid,
+        mut client: Client<C>,
+        req: Request<Body>,
+    ) -> Box<Future<Item = Response<Body>, Error = io::Error> + Send> {
+        let client = client.request(req);
 
-        
+        match self.tracer.clone() {
+            Some(tx) => {
+                let f = tx
+                    .send(Trace::TraceId(format!("{}", req_uuid)))
+                    .map_err(|e| {
+                        println!("Error in trace: {:?}", e);
+                        io::Error::from(io::ErrorKind::Other)
+                    });
+                Box::new(
+                    f.join(client.map(|resp| resp).map_err(|e| {
+                        println!("Error in upstream: {:?}", e);
+                        io::Error::from(io::ErrorKind::Other)
+                    }))
+                    .map(|(_, b)| b),
+                )
+            }
+            None => Box::new(client.map(|resp| resp).map_err(|e| {
+                println!("Error in upstream: {:?}", e);
+                io::Error::from(io::ErrorKind::Other)
+            })),
+        }
+    }
+
+    fn handle_http<C: Connect + 'static>(
+        &self,
+        req_uuid: uuid::Uuid,
+        client: &Client<C>,
+        mut req: Request<Body>,
+    ) -> Box<Future<Item = Response<Body>, Error = io::Error> + Send> {
+        make_absolute(&mut req);
+
+        let client = client.clone().request(req);
+
+        match self.tracer.clone() {
+            Some(tx) => {
+                let f = tx
+                    .send(Trace::TraceId(format!("{}", req_uuid)))
+                    .map_err(|e| {
+                        println!("Error in trace: {:?}", e);
+                        io::Error::from(io::ErrorKind::Other)
+                    });
+                Box::new(
+                    f.join(client.map(|resp| resp).map_err(|e| {
+                        println!("Error in upstream: {:?}", e);
+                        io::Error::from(io::ErrorKind::Other)
+                    }))
+                    .map(|(_, b)| b),
+                )
+            }
+            None => Box::new(client.map(|resp| resp).map_err(|e| {
+                println!("Error in upstream: {:?}", e);
+                io::Error::from(io::ErrorKind::Other)
+            })),
+        }
+    }
+
     fn handle_mitm<C: Connect + 'static>(
-        &self, 
-    client: Client<C>,
-    upstream_addr: std::net::SocketAddr,
-    req: Request<Body>,    
-) -> Box<Future<Item = Response<Body>, Error = io::Error> + Send> {
-    let (resp_tx, resp_rx) = oneshot::channel();
+        &self,
+        req_uuid: uuid::Uuid,
+        client: Client<C>,
+        upstream_addr: std::net::SocketAddr,
+        req: Request<Body>,
+    ) -> Box<Future<Item = Response<Body>, Error = io::Error> + Send> {
+        let (resp_tx, resp_rx) = oneshot::channel();
 
-    // connect, then on_upgrade()
-    // this needs to be reworked
-    // there is a panic in upgrade none
+        // connect, then on_upgrade()
+        // this needs to be reworked
+        // there is a panic in upgrade none
 
-    let authority = req.uri().authority_part().unwrap().clone();
+        let authority = req.uri().authority_part().unwrap().clone();
 
-    let cpair = TcpStream::connect(&upstream_addr)
-        .map_err(|err| eprintln!("mitm tcp connect: {}", err))
-        .and_then(move |upstream| {
-            let cx = SslConnector::builder(SslMethod::tls()).unwrap().build();
+        let cpair = TcpStream::connect(&upstream_addr)
+            .map_err(|err| eprintln!("mitm tcp connect: {}", err))
+            .and_then(move |upstream| {
+                let cx = SslConnector::builder(SslMethod::tls()).unwrap().build();
 
-            cx.connect_async(authority.host(), upstream)
-                .map(|ssl_conn| {
-                    let _ = resp_tx.send(()).unwrap();
-                    println!("MITM Connection established");
+                cx.connect_async(authority.host(), upstream)
+                    .map(|ssl_conn| {
+                        let _ = resp_tx.send(()).unwrap();
+                        println!("MITM Connection established");
 
-                    let peer_cert =
-                        { ssl_conn.get_ref().ssl().peer_certificate().unwrap().clone() };
+                        let peer_cert =
+                            { ssl_conn.get_ref().ssl().peer_certificate().unwrap().clone() };
 
-                    println!(
-                        "Upstream cert: {}",
-                        std::str::from_utf8(&peer_cert.to_pem().unwrap()).unwrap()
-                    );
-                    (ssl_conn, peer_cert)
-                })
-                .map_err(|e| println!("tls error: {:}", e))
-        });
+                        // println!(
+                        //     "Upstream cert: {}",
+                        //     std::str::from_utf8(&peer_cert.to_pem().unwrap()).unwrap()
+                        // );
+                        (ssl_conn, peer_cert)
+                    })
+                    .map_err(|e| println!("tls error: {:}", e))
+            });
 
-    let upgraded = req.into_body().on_upgrade();
+        let upgraded = req.into_body().on_upgrade();
 
-    let ca = self.ca.clone();
-    let upg2 = upgraded
-        .map_err(|err| eprintln!("upgrade: {}", err))
-        .join(cpair)
-        .and_then(move |(downstream, upstream)| {
-            let ca = ca;
-            let (upstream_conn, peer_cert) = upstream;
+        let ca = self.ca.clone();
+        let np = self.dup();
+        let req_uuid = req_uuid.clone();
 
-            let peer_cert_signed = ca.sign_cert_from_cert(&peer_cert).unwrap();
-            println!(
-                "downstream cert: {}",
-                std::str::from_utf8(&peer_cert_signed.to_pem().unwrap()).unwrap()
-            );
-            let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-            acceptor.set_private_key(ca.child_key.as_ref()).unwrap();
-            acceptor.set_certificate(peer_cert_signed.as_ref()).unwrap();
-            acceptor.check_private_key().unwrap();
-            let acceptor = acceptor.build();
+        let upg2 = upgraded
+            .map_err(|err| eprintln!("upgrade: {}", err))
+            .join(cpair)
+            .and_then(move |tuple| {
+                let (downstream, (upstream, peer_cert)) = tuple;
+                let uc = Client::builder().build(AlreadyConnected(Mutex::new(Some(upstream))));
 
-            acceptor
-                .accept_async(downstream)
-                .map_err(|e| eprintln!("accept: {}", e))
-                .and_then(|tls_downstream| {
-                    println!("In MITM up/down");
+                let ca = ca;
+                let req_uuid = req_uuid;
+                //let ( upstream_conn, peer_cert) = upstream;
 
-                    let (u2dr, u2dw) = upstream_conn.split();
-                    let (d2ur, d2uw) = tls_downstream.split();
+                let peer_cert_signed = ca.sign_cert_from_cert(&peer_cert).unwrap();
+                // println!(
+                //     "downstream cert: {}",
+                //     std::str::from_utf8(&peer_cert_signed.to_pem().unwrap()).unwrap()
+                // );
+                let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+                acceptor.set_private_key(ca.child_key.as_ref()).unwrap();
+                acceptor.set_certificate(peer_cert_signed.as_ref()).unwrap();
+                acceptor.check_private_key().unwrap();
+                let acceptor = acceptor.build();
 
-                    let u2df = copy(u2dr, d2uw);
-                    let d2uf = copy(d2ur, u2dw);
-                    d2uf.join(u2df)
-                        .map_err(|err| eprintln!("mitm forward: {}", err))
-                })
-        })
-        .map(|_| ())
-        .map_err(|e| println!("Error {:?}", e));
+                acceptor
+                    .accept_async(downstream)
+                    .map_err(|e| eprintln!("accept: {}", e))
+                    .and_then(move |tls_downstream| {
+                        Http::new()
+                            .serve_connection(
+                                tls_downstream,
+                                service_fn(move |req: Request<Body>| {
+                                    println!("In inner client handler");
+                                    np.handle_http(req_uuid, &uc, req)
+                                }),
+                            )
+                            .map_err(|err| {
+                                eprintln!("Error in inner http: {}", err);
+                                ()
+                            })
 
-    hyper::rt::spawn(upg2);
+                        // This is proxy without analysis, just forward
+                        // serve_connection
+                        // let (u2dr, u2dw) = upstream_conn.split();
+                        // let (d2ur, d2uw) = tls_downstream.split();
 
-    Box::new(
-        resp_rx
-            .map(|_| 200)
-            .or_else(|_| Ok(502))
-            .and_then(|i| result(i)),
-    )
+                        // let u2df = copy(u2dr, d2uw);
+                        // let d2uf = copy(d2ur, u2dw);
+                        // d2uf.join(u2df)
+                        //     .map_err(|err| eprintln!("mitm forward: {}", err));
+                    })
+            })
+            .map(|_| ())
+            .map_err(|e| println!("Error {:?}", e));
+
+        hyper::rt::spawn(upg2);
+
+        Box::new(
+            resp_rx
+                .map(|_| 200)
+                .or_else(|_| Ok(502))
+                .and_then(|i| result(i)),
+        )
+    }
 }
+
+struct AlreadyConnected<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync>(
+    Mutex<Option<T>>,
+);
+
+impl<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync> Connect for AlreadyConnected<T> {
+    type Transport = T;
+    /// An error occured when trying to connect.
+    type Error = io::Error;
+    /// A Future that will resolve to the connected Transport.
+    type Future = Box<Future<Item = (Self::Transport, Connected), Error = Self::Error> + Send>;
+    /// Connect to a destination.
+    fn connect(&self, _: hyper::client::connect::Destination) -> Self::Future {
+        let r = self.0.lock().unwrap().take();
+        Box::new(futures::future::ok((
+            r.unwrap(),
+            hyper::client::connect::Connected::new(),
+        )))
+    }
 }
 
 fn trace_handler(mut rx: mpsc::Receiver<Trace>) {
     let _t = std::thread::spawn(move || {
         let done = rx.for_each(|tx| {
+            match tx {
+                Trace::TraceId(uuid) => {
+                    println!("Begin Tracing {}", uuid);
+                }
+
+                _ => {}
+            }
+
             println!("Trace recv");
             Ok(())
         });
@@ -466,19 +650,20 @@ fn main() {
     let proxy = Proxy {
         tracer: Some(tx),
         ca: ca,
+        auth_config: AuthConfig {
+            authenticate: NoAuth,
+            site: AdWareBlock,
+            authorize: AllowAll,
+        },
     };
 
     let new_svc = move || {
         let proxy = proxy.clone();
-        let auth_config = AuthConfig {
-            authenticate: NoAuth,
-            site: AdWareBlock,
-            authorize: AllowAll,
-        };
-
         let client = client.clone();
-        service_fn(move |req: Request<Body>| proxy.handle(&auth_config, &client, req))
+        service_fn(move |req: Request<Body>| proxy.handle(&client, req))
     };
+
+    // Need an Http
 
     let server = Server::bind(&addr)
         .serve(new_svc)
