@@ -40,6 +40,10 @@ use tokio_openssl::{SslAcceptorExt, SslConnectorExt};
 
 use futures::sync::{mpsc, oneshot};
 use std::sync::Arc;
+
+use mproxy::pool;
+
+
 // use std::sync::mpsc::{channel,Sender};
 
 struct UpstreamConnect<T: AsyncRead + AsyncWrite + Send + 'static + Sync> {
@@ -337,6 +341,8 @@ where
     tracer: Option<mpsc::Sender<Trace>>,
     ca: Arc<ca::CertAuthority>,
     auth_config: AuthConfig<U, S, A>,
+    upstream_ssl_pool: Arc<pool::Pool<tokio_openssl::SslStream<tokio_tcp::TcpStream>>>
+      
 }
 
 impl<U, S, A> Proxy<U, S, A>
@@ -351,6 +357,7 @@ where
             tracer: self.tracer.iter().map(|t| t.clone()).next(),
             ca: self.ca.clone(),
             auth_config: self.auth_config.clone(),
+            upstream_ssl_pool: pool::Pool::empty(100)
         }
     }
 
@@ -527,7 +534,7 @@ where
         let upgraded = req.into_body().on_upgrade();
 
         let ca = self.ca.clone();
-        let np = self.dup();
+        let np = self.clone();
         let req_uuid = req_uuid.clone();
 
         let upg2 = upgraded
@@ -535,8 +542,10 @@ where
             .join(cpair)
             .and_then(move |tuple| {
                 let (downstream, (upstream, peer_cert)) = tuple;
-                let uc = Client::builder().build(AlreadyConnected(Mutex::new(Some(upstream))));
 
+                
+                
+                
                 let ca = ca;
                 let req_uuid = req_uuid;
                 //let ( upstream_conn, peer_cert) = upstream;
@@ -556,11 +565,23 @@ where
                     .accept_async(downstream)
                     .map_err(|e| eprintln!("accept: {}", e))
                     .and_then(move |tls_downstream| {
+
+                        // This should cause the pool to have a single entry
+                        // and then magic
+                        let upstream_pool = {
+                            let local_pool = pool::Pool::empty(1);
+                            let pooled_upstream = pool::PoolItem::new(upstream);
+                            pool::PoolItem::attach(pooled_upstream, local_pool.clone());
+                            local_pool
+                        };
+                        
                         Http::new()
                             .serve_connection(
                                 tls_downstream,
                                 service_fn(move |req: Request<Body>| {
-                                    println!("In inner client handler");
+                                    let upstream_pool = upstream_pool.clone();
+                                    let uc = Client::builder().keep_alive(false).build(AlreadyConnected(upstream_pool));
+                                    println!("In inner client handler: {} {:?}", req_uuid, req);
                                     np.handle_http(req_uuid, &uc, req)
                                 }),
                             )
@@ -594,21 +615,23 @@ where
     }
 }
 
-struct AlreadyConnected<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync>(
-    Mutex<Option<T>>,
-);
+
+
+
+struct AlreadyConnected<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync>(Arc<pool::Pool<T>>);
 
 impl<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync> Connect for AlreadyConnected<T> {
-    type Transport = T;
+    type Transport = pool::PoolItem<T>;
     /// An error occured when trying to connect.
     type Error = io::Error;
     /// A Future that will resolve to the connected Transport.
     type Future = Box<Future<Item = (Self::Transport, Connected), Error = Self::Error> + Send>;
     /// Connect to a destination.
     fn connect(&self, _: hyper::client::connect::Destination) -> Self::Future {
-        let r = self.0.lock().unwrap().take();
+        
+        let o = pool::Pool::checkout(self.0.clone()).unwrap();        
         Box::new(futures::future::ok((
-            r.unwrap(),
+            o,
             hyper::client::connect::Connected::new(),
         )))
     }
@@ -655,6 +678,7 @@ fn main() {
             site: AdWareBlock,
             authorize: AllowAll,
         },
+        upstream_ssl_pool: pool::Pool::empty(100)
     };
 
     let new_svc = move || {
