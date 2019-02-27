@@ -157,41 +157,41 @@ impl<A: Sized> DerefMut for PoolItem<A> {
 }
 
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static next_id: AtomicUsize = AtomicUsize::new(0);
+//     static next_id: AtomicUsize = AtomicUsize::new(0);
 
-    struct Entity {
-        id: usize,
-    }
+//     struct Entity {
+//         id: usize,
+//     }
 
-    impl Reusable for Entity {
-        fn reset(&mut self) {}
-    }
+//     impl Reusable for Entity {
+//         fn reset(&mut self) {}
+//     }
 
-    impl Default for Entity {
-        fn default() -> Entity {
-            Entity {
-                id: next_id.fetch_add(1, Ordering::SeqCst),
-            }
-        }
-    }
+//     impl Default for Entity {
+//         fn default() -> Entity {
+//             Entity {
+//                 id: next_id.fetch_add(1, Ordering::SeqCst),
+//             }
+//         }
+//     }
 
-    #[test]
-    fn test_pool_basic() {
-        let mut pool: Arc<Pool<Entity>> = Pool::with_capacity(4);
+//     #[test]
+//     fn test_pool_basic() {
+//         let mut pool: Arc<Pool<Entity>> = Pool::with_capacity(4);
 
-        {
-            let e1 = Pool::checkout(&mut pool).unwrap();
-            let e2 = Pool::checkout(&mut pool).unwrap();
-            let e3 = Pool::checkout(&mut pool).unwrap();
-            let e4 = Pool::checkout(&mut pool).unwrap();
-            assert!(Pool::checkout(&mut pool).is_err())
-        }
-        let e1 = Pool::checkout(&mut pool).unwrap();
-    }
+//         {
+//             let e1 = Pool::checkout(&mut pool).unwrap();
+//             let e2 = Pool::checkout(&mut pool).unwrap();
+//             let e3 = Pool::checkout(&mut pool).unwrap();
+//             let e4 = Pool::checkout(&mut pool).unwrap();
+//             assert!(Pool::checkout(&mut pool).is_err())
+//         }
+//         let e1 = Pool::checkout(&mut pool).unwrap();
+//     }
 
-}
+// }

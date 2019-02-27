@@ -91,38 +91,6 @@ where
     res
 }
 
-fn is_adware(host: &String) -> bool {
-    host.as_str().starts_with("adservice.google.com")
-}
-
-struct SurfTimeConfig {
-    blacklist: Vec<String>,
-    in_effect: (u64, u64),
-}
-
-struct SurfTime {
-    config: SurfTimeConfig,
-}
-
-struct EndpointMatch {}
-
-struct IdTarget {
-    identifier: String,
-    realm: String,
-}
-
-enum IdMatch {
-    Any,
-    AnyFromRealm(String),
-    RealmGroup { user: String, realms: Vec<String> },
-    AnyRealm { user: String },
-}
-
-struct AuthzMap {
-    auth_input: IdMatch,
-    auth_output: IdTarget,
-    allowed_roles: Vec<EndpointMatch>,
-}
 fn result_502_resolve_failed<'a>(m: &'a str) -> Response<Body> {
     let mut res = Response::new(Body::from(format!("Failed to resolve upstream: {}", m)));
     *res.status_mut() = StatusCode::BAD_GATEWAY;
@@ -244,6 +212,18 @@ fn handle_tls_raw<C: Connect + 'static>(
 fn is_mitm(r: &Request<Body>, mitm_enabled: bool) -> bool {
     true
 }
+
+
+trait RequestFilter {
+    type Future: Future<Item=Request<Body>>;
+    fn filter(&self, req: Request<Body>) -> Self::Future;
+}
+
+trait ResponseFilter {
+    type Future: Future<Item=Response<Body>>;
+    fn filter(&self, req: Response<Body>) -> Self::Future;
+}
+
 
 #[derive(Clone)]
 struct AdWareBlock;
@@ -367,10 +347,6 @@ where
         req: Request<Body>,
     ) -> Box<Future<Item = Response<Body>, Error = io::Error> + Send> {
         let req_uuid = uuid::Uuid::new_v4();
-        println!("Begin request {}", req_uuid);
-
-        println!("Begin request {:?}", req.uri());
-
         let hostname = normalize_authority(req.uri());
 
         // TODO this is slow and not async, and crappy
@@ -521,11 +497,7 @@ where
 
                         let peer_cert =
                             { ssl_conn.get_ref().ssl().peer_certificate().unwrap().clone() };
-
-                        // println!(
-                        //     "Upstream cert: {}",
-                        //     std::str::from_utf8(&peer_cert.to_pem().unwrap()).unwrap()
-                        // );
+                        
                         (ssl_conn, peer_cert)
                     })
                     .map_err(|e| println!("tls error: {:}", e))
@@ -542,19 +514,9 @@ where
             .join(cpair)
             .and_then(move |tuple| {
                 let (downstream, (upstream, peer_cert)) = tuple;
-
-                
-                
-                
                 let ca = ca;
                 let req_uuid = req_uuid;
-                //let ( upstream_conn, peer_cert) = upstream;
-
                 let peer_cert_signed = ca.sign_cert_from_cert(&peer_cert).unwrap();
-                // println!(
-                //     "downstream cert: {}",
-                //     std::str::from_utf8(&peer_cert_signed.to_pem().unwrap()).unwrap()
-                // );
                 let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
                 acceptor.set_private_key(ca.child_key.as_ref()).unwrap();
                 acceptor.set_certificate(peer_cert_signed.as_ref()).unwrap();
@@ -581,7 +543,7 @@ where
                                 service_fn(move |req: Request<Body>| {
                                     let upstream_pool = upstream_pool.clone();
                                     let uc = Client::builder().keep_alive(false).build(AlreadyConnected(upstream_pool));
-                                    println!("In inner client handler: {} {:?}", req_uuid, req);
+                                    // println!("In inner client handler: {} {:?}", req_uuid, req);
                                     np.handle_http(req_uuid, &uc, req)
                                 }),
                             )
@@ -654,7 +616,7 @@ fn trace_handler(mut rx: mpsc::Receiver<Trace>) {
         hyper::rt::run(done);
     });
 }
-
+ 
 fn main() {
     pretty_env_logger::init();
     let addr = ([0, 0, 0, 0], 3000).into();
