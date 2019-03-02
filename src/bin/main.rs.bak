@@ -4,12 +4,12 @@ extern crate tokio_core;
 extern crate tokio_io;
 extern crate openssl;
 extern crate tokio_tls;
-extern crate native_tls;
+// extern crate native_tls;
 extern crate httparse;
 extern crate bytes;
 extern crate mproxy;
-extern crate actix_web;
-extern crate actix;
+// extern crate actix_web;
+// extern crate actix;
 extern crate tokio_openssl;
 extern crate env_logger;
 

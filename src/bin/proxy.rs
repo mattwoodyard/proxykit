@@ -1,8 +1,8 @@
 // #![deny(warnings)]
+extern crate clap;
 extern crate futures;
 extern crate hyper;
 extern crate mproxy;
-extern crate native_tls;
 extern crate openssl;
 extern crate pretty_env_logger;
 extern crate rmp;
@@ -32,6 +32,8 @@ use std::net::ToSocketAddrs;
 use std::sync::Mutex;
 use tokio_io::io::copy;
 
+use clap::{App, Arg, SubCommand};
+
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_tcp::TcpStream;
 
@@ -42,7 +44,6 @@ use futures::sync::{mpsc, oneshot};
 use std::sync::Arc;
 
 use mproxy::pool;
-
 
 // use std::sync::mpsc::{channel,Sender};
 
@@ -213,17 +214,15 @@ fn is_mitm(r: &Request<Body>, mitm_enabled: bool) -> bool {
     true
 }
 
-
 trait RequestFilter {
-    type Future: Future<Item=Request<Body>>;
+    type Future: Future<Item = Request<Body>>;
     fn filter(&self, req: Request<Body>) -> Self::Future;
 }
 
 trait ResponseFilter {
-    type Future: Future<Item=Response<Body>>;
+    type Future: Future<Item = Response<Body>>;
     fn filter(&self, req: Response<Body>) -> Self::Future;
 }
-
 
 #[derive(Clone)]
 struct AdWareBlock;
@@ -285,7 +284,7 @@ fn make_absolute(req: &mut Request<Body>) {
 
             let nuri = req.headers().get(http::header::HOST).map(|host| {
                 let autht: Authority = host.to_str().unwrap().parse().unwrap();
-                
+
                 let mut builder = hyper::Uri::builder();
                 builder.authority(autht);
                 //TODO(matt) do as map[
@@ -301,7 +300,7 @@ fn make_absolute(req: &mut Request<Body>) {
                     builder.scheme("http");
                 }
                 builder.build().unwrap()
-            }); 
+            });
             match nuri {
                 Some(n) => *req.uri_mut() = n,
                 None => {}
@@ -321,8 +320,7 @@ where
     tracer: Option<mpsc::Sender<Trace>>,
     ca: Arc<ca::CertAuthority>,
     auth_config: AuthConfig<U, S, A>,
-    upstream_ssl_pool: Arc<pool::Pool<tokio_openssl::SslStream<tokio_tcp::TcpStream>>>
-      
+    upstream_ssl_pool: Arc<pool::Pool<tokio_openssl::SslStream<tokio_tcp::TcpStream>>>,
 }
 
 impl<U, S, A> Proxy<U, S, A>
@@ -337,7 +335,7 @@ where
             tracer: self.tracer.iter().map(|t| t.clone()).next(),
             ca: self.ca.clone(),
             auth_config: self.auth_config.clone(),
-            upstream_ssl_pool: pool::Pool::empty(100)
+            upstream_ssl_pool: pool::Pool::empty(100),
         }
     }
 
@@ -497,7 +495,7 @@ where
 
                         let peer_cert =
                             { ssl_conn.get_ref().ssl().peer_certificate().unwrap().clone() };
-                        
+
                         (ssl_conn, peer_cert)
                     })
                     .map_err(|e| println!("tls error: {:}", e))
@@ -527,7 +525,6 @@ where
                     .accept_async(downstream)
                     .map_err(|e| eprintln!("accept: {}", e))
                     .and_then(move |tls_downstream| {
-
                         // This should cause the pool to have a single entry
                         // and then magic
                         let upstream_pool = {
@@ -536,13 +533,15 @@ where
                             pool::PoolItem::attach(pooled_upstream, local_pool.clone());
                             local_pool
                         };
-                        
+
                         Http::new()
                             .serve_connection(
                                 tls_downstream,
                                 service_fn(move |req: Request<Body>| {
                                     let upstream_pool = upstream_pool.clone();
-                                    let uc = Client::builder().keep_alive(false).build(AlreadyConnected(upstream_pool));
+                                    let uc = Client::builder()
+                                        .keep_alive(false)
+                                        .build(AlreadyConnected(upstream_pool));
                                     // println!("In inner client handler: {} {:?}", req_uuid, req);
                                     np.handle_http(req_uuid, &uc, req)
                                 }),
@@ -577,10 +576,9 @@ where
     }
 }
 
-
-
-
-struct AlreadyConnected<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync>(Arc<pool::Pool<T>>);
+struct AlreadyConnected<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync>(
+    Arc<pool::Pool<T>>,
+);
 
 impl<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync> Connect for AlreadyConnected<T> {
     type Transport = pool::PoolItem<T>;
@@ -590,8 +588,7 @@ impl<T: Send + 'static + AsyncRead + AsyncWrite + 'static + Sync> Connect for Al
     type Future = Box<Future<Item = (Self::Transport, Connected), Error = Self::Error> + Send>;
     /// Connect to a destination.
     fn connect(&self, _: hyper::client::connect::Destination) -> Self::Future {
-        
-        let o = pool::Pool::checkout(self.0.clone()).unwrap();        
+        let o = pool::Pool::checkout(self.0.clone()).unwrap();
         Box::new(futures::future::ok((
             o,
             hyper::client::connect::Connected::new(),
@@ -616,18 +613,69 @@ fn trace_handler(mut rx: mpsc::Receiver<Trace>) {
         hyper::rt::run(done);
     });
 }
- 
+
+struct ProxyUserConfig {
+    key: String,
+    ca: String,
+    port: u16,
+}
+
+fn parse_options() -> Option<ProxyUserConfig> {
+    let matches = App::new("My Super Program")
+        .version("1.0")
+        .author("Matt Woodyard <matt@mattwoodyard.com>")
+        .about("Be a proxy")
+        .arg(
+            Arg::with_name("cafile")
+                .short("c")
+                .long("cafile")
+                .value_name("CAFILE")
+                .help("Set the root CA certificate ")
+                .required(true)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("caprivatekeyfile")
+                .short("k")
+                .long("caprivatekey")
+                .value_name("KEYFILE")
+                .help("Set the private key file root")
+                .required(true)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("port")
+                .short("p")
+                .long("port")
+                .value_name("PORT")
+                .help("which port do you want to run on")
+                .required(true)
+                .takes_value(true),
+        )
+        .get_matches();
+    Some(ProxyUserConfig {
+        ca: String::from(matches
+            .value_of("cafile")
+            .expect("Must specify CA root certificate file")),
+        key: String::from(matches
+            .value_of("caprivatekeyfile")
+            .expect("Must specify root key file")),
+        port: matches
+            .value_of("port")
+            .map(|s| s.parse::<u16>().expect("Invalid"))
+            .unwrap_or(8080),
+    })
+}
+
 fn main() {
     pretty_env_logger::init();
-    let addr = ([0, 0, 0, 0], 3000).into();
+    let pconfig = parse_options().unwrap();
 
-    let key = "/home/matt/projects/proxykit/server.key";
-    let crt = "/home/matt/projects/proxykit/server.crt";
-    let ca = Arc::new(ca::CertAuthority::from_files(key, crt).unwrap());
+    let ca = Arc::new(ca::CertAuthority::from_files(&pconfig.key, &pconfig.ca).unwrap());
 
     let client = Client::new();
-    println!("Hello!");
 
+    let addr = ([127, 0, 0, 1], pconfig.port).into();
     let (tx, rx) = mpsc::channel(1024);
 
     trace_handler(rx);
@@ -640,7 +688,7 @@ fn main() {
             site: AdWareBlock,
             authorize: AllowAll,
         },
-        upstream_ssl_pool: pool::Pool::empty(100)
+        upstream_ssl_pool: pool::Pool::empty(100),
     };
 
     let new_svc = move || {

@@ -5,18 +5,14 @@ authors = ["Matt Woodyard <matt@mattwoodyard.com>"]
 edition = "2018"
 
 [dependencies]
-#actix = "0.5"
-#actix = { path = "actix" }
-#actix-web = "0.6.10"
-#actix-web = { path = "actix-web" } 
 bincode = "*"
+clap = "*"
 bytes="*"
 env_logger = "*"
 futures = "0.1"
 http ="*"
 httparse = "*"
 hyper ="*"
-native-tls = "*"
 net2 = "*"
 openssl = "0.10"
 pretty_env_logger = "*"
