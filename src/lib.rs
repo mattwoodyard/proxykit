@@ -17,6 +17,7 @@ extern crate rkv;
 pub mod ca;
 pub mod pool;
 pub mod tracer;
+pub mod proto;
 // pub mod rrdb;
 
 // pub mod messages;
