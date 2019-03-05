@@ -12,18 +12,14 @@ extern crate serde_derive;
 extern crate rmp_serde;
 extern crate serde;
 extern crate rkv;
+extern crate warp;
 
 
 pub mod ca;
 pub mod pool;
 pub mod tracer;
 pub mod proto;
-// pub mod rrdb;
-
-// pub mod messages;
-// pub mod piece_buf;
-// pub mod headers;
-// pub mod client;
+pub mod management_service;
 
 #[cfg(test)]
 mod tests {
